@@ -1,0 +1,8 @@
+*.ply
+*.pth
+*.pt
+__pycache__/
+*.egg-info/
+outputs/
+data/
+*.pyc
