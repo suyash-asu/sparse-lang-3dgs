@@ -144,6 +144,8 @@ def align_scale_to_colmap(mono_depth, img_data, points3d, K, R, t):
 
     for row in xys:
         x2d, y2d, pt_id_f = row
+        if np.isnan(pt_id_f):
+            continue
         pt_id = int(pt_id_f)
         if pt_id == -1 or pt_id not in points3d:
             continue
