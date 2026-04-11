@@ -39,75 +39,72 @@ def estimate_depth(model, transform, image_path, device="cuda"):
 
 
 def read_colmap_cameras(sparse_dir):
-    """Read cameras.bin from COLMAP sparse folder."""
+    """Read cameras.bin using 3DGS's proven COLMAP reader."""
+    import sys
     import collections
+    gs_path = str(Path(__file__).parent.parent.parent / "gaussian-splatting")
+    if gs_path not in sys.path:
+        sys.path.insert(0, gs_path)
+    
+    from scene.colmap_loader import read_intrinsics_binary
+    
     Camera = collections.namedtuple(
         "Camera", ["id", "model", "width", "height", "params"])
+    
+    bin_path = os.path.join(sparse_dir, "cameras.bin")
+    cam_intrinsics = read_intrinsics_binary(bin_path)
+    
     cameras = {}
-    with open(os.path.join(sparse_dir, "cameras.bin"), "rb") as f:
-        num_cameras = struct.unpack("<Q", f.read(8))[0]
-        for _ in range(num_cameras):
-            cam_id = struct.unpack("<I", f.read(4))[0]
-            model_id = struct.unpack("<i", f.read(4))[0]
-            width = struct.unpack("<Q", f.read(8))[0]
-            height = struct.unpack("<Q", f.read(8))[0]
-            num_params = {0:3,1:4,2:4,3:4,4:5,5:8,6:8,7:12}.get(model_id, 4)
-            params = struct.unpack(f"<{num_params}d", f.read(8*num_params))
-            cameras[cam_id] = Camera(cam_id, model_id, width, height, params)
+    for cam_id, intr in cam_intrinsics.items():
+        cameras[cam_id] = Camera(
+            intr.id, intr.model, intr.width, intr.height, intr.params)
     return cameras
 
+def read_colmap_points3d(sparse_dir):
+    """Read points3D.bin using 3DGS's proven COLMAP reader."""
+    import sys
+    gs_path = str(Path(__file__).parent.parent.parent / "gaussian-splatting")
+    if gs_path not in sys.path:
+        sys.path.insert(0, gs_path)
+    
+    from scene.colmap_loader import read_points3D_binary
+    
+    bin_path = os.path.join(sparse_dir, "points3D.bin")
+    pts3d_raw = read_points3D_binary(bin_path)
+    
+    # pts3d_raw is dict of id -> Point3D namedtuple with .xyz
+    points3d = {pt_id: np.array(pt.xyz) 
+                for pt_id, pt in pts3d_raw.items()}
+    return points3d
 
 def read_colmap_images(sparse_dir):
-    """Read images.bin — returns only pose info (no 2D point tracks)."""
+    """Read images.bin using 3DGS's proven COLMAP reader."""
+    import sys
+    # Use the 3DGS COLMAP reader which handles all format variants correctly
+    gs_path = str(Path(__file__).parent.parent.parent / "gaussian-splatting")
+    if gs_path not in sys.path:
+        sys.path.insert(0, gs_path)
+    
+    from scene.colmap_loader import read_extrinsics_binary
+    
+    bin_path = os.path.join(sparse_dir, "images.bin")
+    cam_extrinsics = read_extrinsics_binary(bin_path)
+    
     images = {}
-    with open(os.path.join(sparse_dir, "images.bin"), "rb") as f:
-        num_images = struct.unpack("<Q", f.read(8))[0]
-        for _ in range(num_images):
-            image_id = struct.unpack("<I", f.read(4))[0]
-            qvec = struct.unpack("<4d", f.read(32))
-            tvec = struct.unpack("<3d", f.read(24))
-            camera_id = struct.unpack("<I", f.read(4))[0]
-            name = b""
-            while True:
-                c = f.read(1)
-                if c == b"\x00":
-                    break
-                name += c
-            name = name.decode("utf-8")
-            num_points = struct.unpack("<Q", f.read(8))[0]
-            # Each 2D point: x (float32), y (float32), point3D_id (int64)
-            # Total: 4 + 4 + 8 = 16 bytes per point
-            xys = []
-            for _ in range(num_points):
-                x = struct.unpack("<f", f.read(4))[0]
-                y = struct.unpack("<f", f.read(4))[0]
-                pt3d_id = struct.unpack("<q", f.read(8))[0]  # signed int64
-                xys.append([x, y, pt3d_id])
-            images[image_id] = {
-                "name": name,
-                "qvec": np.array(qvec),
-                "tvec": np.array(tvec),
-                "camera_id": camera_id,
-                "xys": np.array(xys) if xys else np.zeros((0, 3))
-            }
+    for img_id, extr in cam_extrinsics.items():
+        # extr has: id, qvec, tvec, camera_id, name, xys, point3D_ids
+        xys_combined = np.zeros((len(extr.xys), 3))
+        if len(extr.xys) > 0:
+            xys_combined[:, :2] = np.array(extr.xys)
+            xys_combined[:, 2] = np.array(extr.point3D_ids, dtype=float)
+        images[img_id] = {
+            "name": extr.name,
+            "qvec": np.array(extr.qvec),
+            "tvec": np.array(extr.tvec),
+            "camera_id": extr.camera_id,
+            "xys": xys_combined
+        }
     return images
-
-
-def read_colmap_points3d(sparse_dir):
-    """Read points3D.bin — returns dict of point_id -> xyz."""
-    points3d = {}
-    bin_path = os.path.join(sparse_dir, "points3D.bin")
-    with open(bin_path, "rb") as f:
-        num_pts = struct.unpack("<Q", f.read(8))[0]
-        for _ in range(num_pts):
-            pt_id = struct.unpack("<Q", f.read(8))[0]
-            xyz = struct.unpack("<3d", f.read(24))
-            rgb = struct.unpack("<3B", f.read(3))
-            err = struct.unpack("<d", f.read(8))[0]
-            track_len = struct.unpack("<Q", f.read(8))[0]
-            f.read(track_len * 8)  # skip track data
-            points3d[pt_id] = np.array(xyz)
-    return points3d
 
 
 def qvec_to_rotmat(qvec):
