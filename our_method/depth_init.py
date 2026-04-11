@@ -75,16 +75,20 @@ def read_colmap_images(sparse_dir):
                 name += c
             name = name.decode("utf-8")
             num_points = struct.unpack("<Q", f.read(8))[0]
-            # Read 2D point tracks: each entry is (x, y, point3D_id) = 2 floats + 1 long
-            xys_ids = struct.unpack(f"<{num_points * 3}d",
-                                    f.read(num_points * 24))
+            # Each 2D point: x (float32), y (float32), point3D_id (int64)
+            # Total: 4 + 4 + 8 = 16 bytes per point
+            xys = []
+            for _ in range(num_points):
+                x = struct.unpack("<f", f.read(4))[0]
+                y = struct.unpack("<f", f.read(4))[0]
+                pt3d_id = struct.unpack("<q", f.read(8))[0]  # signed int64
+                xys.append([x, y, pt3d_id])
             images[image_id] = {
                 "name": name,
                 "qvec": np.array(qvec),
                 "tvec": np.array(tvec),
                 "camera_id": camera_id,
-                "xys": np.array(xys_ids).reshape(-1, 3) if num_points > 0
-                       else np.zeros((0, 3))
+                "xys": np.array(xys) if xys else np.zeros((0, 3))
             }
     return images
 
@@ -146,7 +150,7 @@ def align_scale_to_colmap(mono_depth, img_data, points3d, K, R, t):
         x2d, y2d, pt_id_f = row
         if np.isnan(pt_id_f):
             continue
-        pt_id = int(pt_id_f)
+        pt_id = int(row[2])
         if pt_id == -1 or pt_id not in points3d:
             continue
 
