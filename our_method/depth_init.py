@@ -5,32 +5,25 @@ import struct
 from pathlib import Path
 from plyfile import PlyData, PlyElement
 
+
 def load_depth_model(device="cuda"):
     """Load MiDaS DPT-Large for monocular depth estimation."""
     import torch
     model = torch.hub.load("intel-isl/MiDaS", "DPT_Large", trust_repo=True)
     model = model.to(device)
     model.eval()
-
     transforms = torch.hub.load("intel-isl/MiDaS", "transforms", trust_repo=True)
     transform = transforms.dpt_transform
-
     print("MiDaS DPT-Large loaded successfully")
     return model, transform
 
-def estimate_depth(model, transform, image_path, device="cuda"):
-    """
-    Run MiDaS on a single image.
-    Returns (H, W) numpy depth map (relative, not metric).
-    """
-    import torch
-    import cv2
 
+def estimate_depth(model, transform, image_path, device="cuda"):
+    """Run MiDaS on a single image. Returns (H,W) numpy depth map."""
+    import torch
     img = cv2.imread(str(image_path))
     img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-
     input_batch = transform(img_rgb).to(device)
-
     with torch.no_grad():
         prediction = model(input_batch)
         prediction = torch.nn.functional.interpolate(
@@ -39,13 +32,11 @@ def estimate_depth(model, transform, image_path, device="cuda"):
             mode="bicubic",
             align_corners=False,
         ).squeeze()
-
     depth = prediction.cpu().numpy()
-    # Normalize to 0-1 range (MiDaS output is inverse depth)
     depth = (depth - depth.min()) / (depth.max() - depth.min() + 1e-8)
-    # Invert to get depth (not disparity)
     depth = 1.0 - depth
     return depth
+
 
 def read_colmap_cameras(sparse_dir):
     """Read cameras.bin from COLMAP sparse folder."""
@@ -60,106 +51,167 @@ def read_colmap_cameras(sparse_dir):
             model_id = struct.unpack("<i", f.read(4))[0]
             width = struct.unpack("<Q", f.read(8))[0]
             height = struct.unpack("<Q", f.read(8))[0]
-            # PINHOLE model has 4 params: fx, fy, cx, cy
-            num_params = {0: 3, 1: 4, 2: 4, 3: 4, 4: 5, 5: 8, 6: 8, 7: 12}.get(model_id, 4)
-            params = struct.unpack(f"<{num_params}d", f.read(8 * num_params))
+            num_params = {0:3,1:4,2:4,3:4,4:5,5:8,6:8,7:12}.get(model_id, 4)
+            params = struct.unpack(f"<{num_params}d", f.read(8*num_params))
             cameras[cam_id] = Camera(cam_id, model_id, width, height, params)
     return cameras
 
+
 def read_colmap_images(sparse_dir):
-    """Read images.bin from COLMAP sparse folder."""
+    """Read images.bin — returns only pose info (no 2D point tracks)."""
     images = {}
     with open(os.path.join(sparse_dir, "images.bin"), "rb") as f:
         num_images = struct.unpack("<Q", f.read(8))[0]
         for _ in range(num_images):
             image_id = struct.unpack("<I", f.read(4))[0]
-            qvec = struct.unpack("<4d", f.read(32))  # qw, qx, qy, qz
+            qvec = struct.unpack("<4d", f.read(32))
             tvec = struct.unpack("<3d", f.read(24))
             camera_id = struct.unpack("<I", f.read(4))[0]
             name = b""
             while True:
                 c = f.read(1)
-                if c == b"\x00": break
+                if c == b"\x00":
+                    break
                 name += c
             name = name.decode("utf-8")
             num_points = struct.unpack("<Q", f.read(8))[0]
-            f.read(num_points * 24)
+            # Read 2D point tracks: each entry is (x, y, point3D_id) = 2 floats + 1 long
+            xys_ids = struct.unpack(f"<{num_points * 3}d",
+                                    f.read(num_points * 24))
             images[image_id] = {
                 "name": name,
                 "qvec": np.array(qvec),
                 "tvec": np.array(tvec),
-                "camera_id": camera_id
+                "camera_id": camera_id,
+                "xys": np.array(xys_ids).reshape(-1, 3) if num_points > 0
+                       else np.zeros((0, 3))
             }
     return images
 
+
+def read_colmap_points3d(sparse_dir):
+    """Read points3D.bin — returns dict of point_id -> xyz."""
+    points3d = {}
+    bin_path = os.path.join(sparse_dir, "points3D.bin")
+    with open(bin_path, "rb") as f:
+        num_pts = struct.unpack("<Q", f.read(8))[0]
+        for _ in range(num_pts):
+            pt_id = struct.unpack("<Q", f.read(8))[0]
+            xyz = struct.unpack("<3d", f.read(24))
+            rgb = struct.unpack("<3B", f.read(3))
+            err = struct.unpack("<d", f.read(8))[0]
+            track_len = struct.unpack("<Q", f.read(8))[0]
+            f.read(track_len * 8)  # skip track data
+            points3d[pt_id] = np.array(xyz)
+    return points3d
+
+
 def qvec_to_rotmat(qvec):
-    """Convert quaternion to rotation matrix."""
+    """Convert quaternion (w,x,y,z) to 3x3 rotation matrix."""
     w, x, y, z = qvec
-    R = np.array([
-        [1-2*y*y-2*z*z,   2*x*y-2*w*z,   2*x*z+2*w*y],
-        [  2*x*y+2*w*z, 1-2*x*x-2*z*z,   2*y*z-2*w*x],
-        [  2*x*z-2*w*y,   2*y*z+2*w*x, 1-2*x*x-2*y*y]
+    return np.array([
+        [1-2*y*y-2*z*z,  2*x*y-2*w*z,  2*x*z+2*w*y],
+        [  2*x*y+2*w*z,1-2*x*x-2*z*z,  2*y*z-2*w*x],
+        [  2*x*z-2*w*y,  2*y*z+2*w*x,1-2*x*x-2*y*y]
     ])
-    return R
+
+
+def align_scale_to_colmap(mono_depth, img_data, points3d, K, R, t):
+    """
+    Align MiDaS relative depth to metric COLMAP scale using sparse 3D
+    points visible in this image as anchors.
+
+    Solves: mono_depth * scale + shift = colmap_metric_depth
+    via least squares over all visible COLMAP points.
+
+    Args:
+        mono_depth : (H, W) MiDaS depth map (relative, 0-1)
+        img_data   : dict with 'xys' array of shape (N, 3) — each row
+                     is (x_pixel, y_pixel, point3D_id)
+        points3d   : dict of point3D_id -> xyz (world coords)
+        K          : (3,3) camera intrinsics
+        R          : (3,3) rotation matrix (world-to-camera)
+        t          : (3,) translation vector (world-to-camera)
+
+    Returns:
+        scale, shift : floats for aligned_depth = mono * scale + shift
+    """
+    H, W = mono_depth.shape
+    xys = img_data["xys"]  # (N, 3): x, y, point3d_id
+
+    sfm_mono = []    # MiDaS depth at SfM point locations
+    sfm_metric = []  # COLMAP metric depth at same locations
+
+    for row in xys:
+        x2d, y2d, pt_id_f = row
+        pt_id = int(pt_id_f)
+        if pt_id == -1 or pt_id not in points3d:
+            continue
+
+        # Project 3D point into camera to get metric depth
+        pt_world = points3d[pt_id]
+        pt_cam = R @ pt_world + t
+        depth_metric = pt_cam[2]
+
+        if depth_metric < 0.1:
+            continue
+
+        # Sample MiDaS depth at this pixel
+        px = int(np.clip(x2d, 0, W - 1))
+        py = int(np.clip(y2d, 0, H - 1))
+        mono_val = mono_depth[py, px]
+
+        if mono_val < 0.01:
+            continue
+
+        sfm_mono.append(mono_val)
+        sfm_metric.append(depth_metric)
+
+    n_anchors = len(sfm_mono)
+    if n_anchors < 3:
+        print(f"  Warning: only {n_anchors} anchor points — using scale=1")
+        return 1.0, 0.0
+
+    # Least squares: [mono | 1] * [scale, shift]^T = metric_depth
+    A = np.stack([sfm_mono, np.ones(n_anchors)], axis=1)
+    b = np.array(sfm_metric)
+    result = np.linalg.lstsq(A, b, rcond=None)
+    scale, shift = result[0]
+
+    print(f"  Scale alignment: scale={scale:.4f}, shift={shift:.4f} "
+          f"from {n_anchors} anchor points")
+    return float(scale), float(shift)
+
 
 def depth_to_world_points(depth, K, R, t, stride=4):
-    """
-    Back-project depth map to 3D world points.
-    stride: subsample every N pixels to keep point count manageable
-    """
+    """Back-project depth map to 3D world points."""
     H, W = depth.shape
     fx, fy, cx, cy = K[0,0], K[1,1], K[0,2], K[1,2]
 
-    # Create pixel grid (subsampled)
     u = np.arange(0, W, stride)
     v = np.arange(0, H, stride)
     uu, vv = np.meshgrid(u, v)
     dd = depth[vv, uu]
 
-    # Filter invalid depths
     valid = (dd > 0.1) & (dd < 100.0)
     uu, vv, dd = uu[valid], vv[valid], dd[valid]
 
-    # Back-project to camera coordinates
     x_cam = (uu - cx) * dd / fx
     y_cam = (vv - cy) * dd / fy
     z_cam = dd
-    pts_cam = np.stack([x_cam, y_cam, z_cam], axis=1)  # (N, 3)
+    pts_cam = np.stack([x_cam, y_cam, z_cam], axis=1)
 
-    # Transform to world coordinates
-    # world = R^T * (cam - t)
-    pts_world = (R.T @ (pts_cam.T - t.reshape(3,1))).T
-
+    # COLMAP: x_cam = R @ x_world + t  =>  x_world = R^T @ (x_cam - t)
+    pts_world = (R.T @ (pts_cam.T - t.reshape(3, 1))).T
     return pts_world
 
-def align_depth_scale(mono_depth, colmap_points_2d, colmap_depths):
-    """
-    Align monocular depth scale to metric COLMAP depth via least squares.
-    mono_depth * scale + shift = colmap_depth
-    """
-    if len(colmap_points_2d) < 3:
-        return 1.0, 0.0
-
-    px = np.clip(colmap_points_2d[:, 0].astype(int), 0, mono_depth.shape[1]-1)
-    py = np.clip(colmap_points_2d[:, 1].astype(int), 0, mono_depth.shape[0]-1)
-    mono_at_pts = mono_depth[py, px]
-
-    valid = mono_at_pts > 0.01
-    if valid.sum() < 3:
-        return 1.0, 0.0
-
-    A = np.stack([mono_at_pts[valid],
-                  np.ones(valid.sum())], axis=1)
-    b = colmap_depths[valid]
-    result = np.linalg.lstsq(A, b, rcond=None)
-    scale, shift = result[0]
-    return float(scale), float(shift)
 
 def create_depth_init(sparse_data_dir, output_ply_path,
                       device="cuda", stride=4):
     """
-    Main function: generate dense point cloud from monocular depth.
-    Replaces sparse SfM initialization in 3DGS.
+    Generate a dense depth-lifted point cloud from monocular depth estimates.
+    Depth is scale-aligned to COLMAP metric coordinates using sparse 3D
+    points as anchors. Output PLY replaces points3D.ply for 3DGS init.
     """
     sparse_data_dir = Path(sparse_data_dir)
     sparse_dir = sparse_data_dir / "sparse" / "0"
@@ -169,7 +221,12 @@ def create_depth_init(sparse_data_dir, output_ply_path,
     cameras = read_colmap_cameras(str(sparse_dir))
     images = read_colmap_images(str(sparse_dir))
 
-    print("Loading ZoeDepth model...")
+    # Load original points3D.bin for scale alignment anchors
+    print("Loading COLMAP 3D points for scale alignment...")
+    points3d = read_colmap_points3d(str(sparse_dir))
+    print(f"  {len(points3d)} 3D anchor points loaded")
+
+    print("Loading MiDaS depth model...")
     model, transform = load_depth_model(device)
 
     all_points = []
@@ -182,38 +239,40 @@ def create_depth_init(sparse_data_dir, output_ply_path,
 
         print(f"Processing {img_data['name']}...")
 
-        # Get camera intrinsics
+        # Camera intrinsics
         cam = cameras[img_data["camera_id"]]
-        fx, fy, cx, cy = cam.params[0], cam.params[1], cam.params[2], cam.params[3]
+        fx = cam.params[0]
+        fy = cam.params[1] if len(cam.params) > 1 else cam.params[0]
+        cx = cam.params[2] if len(cam.params) > 2 else cam.width / 2
+        cy = cam.params[3] if len(cam.params) > 3 else cam.height / 2
         K = np.array([[fx, 0, cx], [0, fy, cy], [0, 0, 1]])
 
-        # Get camera pose (COLMAP convention: x_cam = R * x_world + t)
+        # Camera pose
         R = qvec_to_rotmat(img_data["qvec"])
         t = np.array(img_data["tvec"])
 
-        # Estimate monocular depth
+        # Estimate relative depth with MiDaS
         mono_depth = estimate_depth(model, transform, str(img_path), device)
 
-        # Resize depth to match image
+        # Resize depth to match original image size
         img_cv = cv2.imread(str(img_path))
         H, W = img_cv.shape[:2]
         mono_depth = cv2.resize(mono_depth, (W, H),
                                 interpolation=cv2.INTER_LINEAR)
 
-        # Scale alignment using COLMAP points (if available)
-        # For simplicity, use median scaling based on scene bounds
-        # A more robust version reads points3D.bin for alignment
-        scale = 1.0
-        shift = 0.0
+        # ── KEY FIX: align MiDaS relative depth to COLMAP metric scale ──
+        scale, shift = align_scale_to_colmap(
+            mono_depth, img_data, points3d, K, R, t)
 
-        # Apply scale
+        # Apply alignment
         aligned_depth = mono_depth * scale + shift
         aligned_depth = np.clip(aligned_depth, 0.1, 100.0)
 
-        # Back-project to world points
-        pts_world = depth_to_world_points(aligned_depth, K, R, t, stride=stride)
+        # Back-project to world coordinates
+        pts_world = depth_to_world_points(aligned_depth, K, R, t,
+                                          stride=stride)
 
-        # Get colors from image
+        # Get colors from RGB image
         img_rgb = cv2.cvtColor(img_cv, cv2.COLOR_BGR2RGB)
         u = np.arange(0, W, stride)
         v = np.arange(0, H, stride)
@@ -233,6 +292,7 @@ def create_depth_init(sparse_data_dir, output_ply_path,
     all_colors = np.concatenate(all_colors, axis=0)
     print(f"Total points: {len(all_points)}")
 
+    # Save PLY with normals (required by 3DGS)
     os.makedirs(os.path.dirname(output_ply_path), exist_ok=True)
     colors_uint8 = (all_colors * 255).clip(0, 255).astype(np.uint8)
     normals = np.zeros_like(all_points)
@@ -248,6 +308,7 @@ def create_depth_init(sparse_data_dir, output_ply_path,
     PlyData([el]).write(output_ply_path)
     print(f"Saved depth-init PLY to {output_ply_path}")
     return output_ply_path
+
 
 if __name__ == "__main__":
     import argparse
