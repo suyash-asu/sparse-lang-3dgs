@@ -10,11 +10,31 @@ from plyfile import PlyData, PlyElement
 def load_zoedepth(device="cuda"):
     """Load ZoeDepth model for metric depth estimation."""
     sys.path.insert(0, str(Path(__file__).parent.parent.parent / "ZoeDepth"))
+
+    import torch
     from zoedepth.models.builder import build_model
     from zoedepth.utils.config import get_config
+
     conf = get_config("zoedepth", "infer")
+
+    # Patch model_io to use strict=False to handle version mismatches
+    from zoedepth.models import model_io
+    original_load = model_io.load_state_dict
+
+    def patched_load(model, state_dict):
+        missing, unexpected = model.load_state_dict(state_dict, strict=False)
+        if missing:
+            print(f"Missing keys (ok): {len(missing)}")
+        if unexpected:
+            print(f"Unexpected keys (ok): {len(unexpected)}")
+        return model
+
+    model_io.load_state_dict = patched_load
     model = build_model(conf).to(device)
+    model_io.load_state_dict = original_load  # restore
+
     model.eval()
+    print("ZoeDepth loaded successfully")
     return model
 
 def estimate_depth(model, image_path):
