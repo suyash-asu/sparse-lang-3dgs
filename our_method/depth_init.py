@@ -207,6 +207,7 @@ def depth_to_world_points(depth, K, R, t, stride=4):
 
 
 def create_depth_init(sparse_data_dir, output_ply_path,
+                      original_data_dir=None,
                       device="cuda", stride=4):
     """
     Generate a dense depth-lifted point cloud from monocular depth estimates.
@@ -221,10 +222,23 @@ def create_depth_init(sparse_data_dir, output_ply_path,
     cameras = read_colmap_cameras(str(sparse_dir))
     images = read_colmap_images(str(sparse_dir))
 
-    # Load original points3D.bin for scale alignment anchors
-    print("Loading COLMAP 3D points for scale alignment...")
-    points3d = read_colmap_points3d(str(sparse_dir))
-    print(f"  {len(points3d)} 3D anchor points loaded")
+    # ── NEW BLOCK: load tracks and points from original full dataset ──
+    if original_data_dir is not None:
+        orig_sparse = Path(original_data_dir) / "sparse" / "0"
+        print("Loading full-dataset images for scale alignment anchors...")
+        images_with_tracks = read_colmap_images(str(orig_sparse))
+        points3d = read_colmap_points3d(str(orig_sparse))
+        print(f"  {len(points3d)} 3D anchor points loaded")
+        # Copy 2D track data into our subsampled images by matching name
+        for img_id, img_data in images.items():
+            for orig_id, orig_data in images_with_tracks.items():
+                if orig_data["name"] == img_data["name"]:
+                    img_data["xys"] = orig_data["xys"]
+                    break
+    else:
+        print("Loading COLMAP 3D points for scale alignment...")
+        points3d = read_colmap_points3d(str(sparse_dir))
+        print(f"  {len(points3d)} 3D anchor points loaded")
 
     print("Loading MiDaS depth model...")
     model, transform = load_depth_model(device)
@@ -260,7 +274,7 @@ def create_depth_init(sparse_data_dir, output_ply_path,
         mono_depth = cv2.resize(mono_depth, (W, H),
                                 interpolation=cv2.INTER_LINEAR)
 
-        # ── KEY FIX: align MiDaS relative depth to COLMAP metric scale ──
+        # Align MiDaS relative depth to COLMAP metric scale
         scale, shift = align_scale_to_colmap(
             mono_depth, img_data, points3d, K, R, t)
 
@@ -317,6 +331,10 @@ if __name__ == "__main__":
     parser.add_argument("--output_ply", required=True)
     parser.add_argument("--stride", type=int, default=4)
     parser.add_argument("--device", default="cuda")
+    parser.add_argument("--original_data_dir", default=None,
+                    help="Original full dataset dir for scale alignment")
     args = parser.parse_args()
     create_depth_init(args.data_dir, args.output_ply,
-                      args.device, args.stride)
+                  original_data_dir=args.original_data_dir,
+                  device=args.device,
+                  stride=args.stride)
