@@ -5,28 +5,47 @@ import struct
 from pathlib import Path
 from plyfile import PlyData, PlyElement
 
-def load_zoedepth(device="cuda"):
-    """Load ZoeDepth via torch.hub (handles dependencies automatically)."""
+def load_depth_model(device="cuda"):
+    """Load MiDaS DPT-Large for monocular depth estimation."""
     import torch
-    model = torch.hub.load(
-        "isl-org/ZoeDepth",
-        "ZoeD_N",
-        pretrained=True,
-        trust_repo=True
-    )
+    model = torch.hub.load("intel-isl/MiDaS", "DPT_Large", trust_repo=True)
     model = model.to(device)
     model.eval()
-    print("ZoeDepth loaded successfully")
-    return model
 
-def estimate_depth(model, image_path):
-    """Run ZoeDepth on a single image. Returns (H,W) numpy depth map."""
-    from PIL import Image
+    transforms = torch.hub.load("intel-isl/MiDaS", "transforms", trust_repo=True)
+    transform = transforms.dpt_transform
+
+    print("MiDaS DPT-Large loaded successfully")
+    return model, transform
+
+def estimate_depth(model, transform, image_path, device="cuda"):
+    """
+    Run MiDaS on a single image.
+    Returns (H, W) numpy depth map (relative, not metric).
+    """
     import torch
-    img = Image.open(image_path).convert("RGB")
+    import cv2
+
+    img = cv2.imread(str(image_path))
+    img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+
+    input_batch = transform(img_rgb).to(device)
+
     with torch.no_grad():
-        depth = model.infer_pil(img)
-    return depth.squeeze().cpu().numpy()
+        prediction = model(input_batch)
+        prediction = torch.nn.functional.interpolate(
+            prediction.unsqueeze(1),
+            size=img_rgb.shape[:2],
+            mode="bicubic",
+            align_corners=False,
+        ).squeeze()
+
+    depth = prediction.cpu().numpy()
+    # Normalize to 0-1 range (MiDaS output is inverse depth)
+    depth = (depth - depth.min()) / (depth.max() - depth.min() + 1e-8)
+    # Invert to get depth (not disparity)
+    depth = 1.0 - depth
+    return depth
 
 def read_colmap_cameras(sparse_dir):
     """Read cameras.bin from COLMAP sparse folder."""
@@ -151,7 +170,7 @@ def create_depth_init(sparse_data_dir, output_ply_path,
     images = read_colmap_images(str(sparse_dir))
 
     print("Loading ZoeDepth model...")
-    model = load_zoedepth(device)
+    model, transform = load_depth_model(device)
 
     all_points = []
     all_colors = []
@@ -173,7 +192,7 @@ def create_depth_init(sparse_data_dir, output_ply_path,
         t = np.array(img_data["tvec"])
 
         # Estimate monocular depth
-        mono_depth = estimate_depth(model, str(img_path))
+        mono_depth = estimate_depth(model, transform, str(img_path), device)
 
         # Resize depth to match image
         img_cv = cv2.imread(str(img_path))
