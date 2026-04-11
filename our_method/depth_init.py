@@ -233,13 +233,17 @@ def create_depth_init(sparse_data_dir, output_ply_path,
     all_colors = np.concatenate(all_colors, axis=0)
     print(f"Total points: {len(all_points)}")
 
-    # Save as PLY
+    # Save as PLY with uint8 colors (compatible with all viewers)
+    os.makedirs(os.path.dirname(os.path.dirname(output_ply_path)), 
+                exist_ok=True)
     os.makedirs(os.path.dirname(output_ply_path), exist_ok=True)
+    
+    colors_uint8 = (all_colors * 255).clip(0, 255).astype(np.uint8)
     vertex = np.array(
         [(p[0], p[1], p[2], c[0], c[1], c[2])
-         for p, c in zip(all_points, all_colors)],
+         for p, c in zip(all_points, colors_uint8)],
         dtype=[("x","f4"),("y","f4"),("z","f4"),
-               ("red","f4"),("green","f4"),("blue","f4")]
+               ("red","u1"),("green","u1"),("blue","u1")]
     )
     el = PlyElement.describe(vertex, "vertex")
     PlyData([el]).write(output_ply_path)
