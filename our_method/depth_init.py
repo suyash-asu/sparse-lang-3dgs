@@ -1,6 +1,4 @@
 import os
-import sys
-import torch
 import numpy as np
 import cv2
 import struct
@@ -8,31 +6,15 @@ from pathlib import Path
 from plyfile import PlyData, PlyElement
 
 def load_zoedepth(device="cuda"):
-    """Load ZoeDepth model for metric depth estimation."""
-    sys.path.insert(0, str(Path(__file__).parent.parent.parent / "ZoeDepth"))
-
+    """Load ZoeDepth via torch.hub (handles dependencies automatically)."""
     import torch
-    from zoedepth.models.builder import build_model
-    from zoedepth.utils.config import get_config
-
-    conf = get_config("zoedepth", "infer")
-
-    # Patch model_io to use strict=False to handle version mismatches
-    from zoedepth.models import model_io
-    original_load = model_io.load_state_dict
-
-    def patched_load(model, state_dict):
-        missing, unexpected = model.load_state_dict(state_dict, strict=False)
-        if missing:
-            print(f"Missing keys (ok): {len(missing)}")
-        if unexpected:
-            print(f"Unexpected keys (ok): {len(unexpected)}")
-        return model
-
-    model_io.load_state_dict = patched_load
-    model = build_model(conf).to(device)
-    model_io.load_state_dict = original_load  # restore
-
+    model = torch.hub.load(
+        "isl-org/ZoeDepth",
+        "ZoeD_N",
+        pretrained=True,
+        trust_repo=True
+    )
+    model = model.to(device)
     model.eval()
     print("ZoeDepth loaded successfully")
     return model
@@ -40,6 +22,7 @@ def load_zoedepth(device="cuda"):
 def estimate_depth(model, image_path):
     """Run ZoeDepth on a single image. Returns (H,W) numpy depth map."""
     from PIL import Image
+    import torch
     img = Image.open(image_path).convert("RGB")
     with torch.no_grad():
         depth = model.infer_pil(img)
