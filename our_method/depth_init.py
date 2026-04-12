@@ -45,64 +45,48 @@ def read_colmap_cameras(sparse_dir):
     gs_path = str(Path(__file__).parent.parent.parent / "gaussian-splatting")
     if gs_path not in sys.path:
         sys.path.insert(0, gs_path)
-    
     from scene.colmap_loader import read_intrinsics_binary
-    
     Camera = collections.namedtuple(
         "Camera", ["id", "model", "width", "height", "params"])
-    
-    bin_path = os.path.join(sparse_dir, "cameras.bin")
-    cam_intrinsics = read_intrinsics_binary(bin_path)
-    
-    cameras = {}
-    for cam_id, intr in cam_intrinsics.items():
-        cameras[cam_id] = Camera(
-            intr.id, intr.model, intr.width, intr.height, intr.params)
-    return cameras
+    cam_intrinsics = read_intrinsics_binary(
+        os.path.join(sparse_dir, "cameras.bin"))
+    return {cam_id: Camera(i.id, i.model, i.width, i.height, i.params)
+            for cam_id, i in cam_intrinsics.items()}
 
 def read_colmap_points3d(sparse_dir):
-    """Read points3D.bin using 3DGS's proven COLMAP reader."""
-    import sys
-    gs_path = str(Path(__file__).parent.parent.parent / "gaussian-splatting")
-    if gs_path not in sys.path:
-        sys.path.insert(0, gs_path)
-    
-    from scene.colmap_loader import read_points3D_binary
-    
+    """Read points3D.bin — returns dict of point_id -> xyz (world coords)."""
+    points3d = {}
     bin_path = os.path.join(sparse_dir, "points3D.bin")
-    pts3d_raw = read_points3D_binary(bin_path)
-    
-    # pts3d_raw is dict of id -> Point3D namedtuple with .xyz
-    points3d = {pt_id: np.array(pt.xyz) 
-                for pt_id, pt in pts3d_raw.items()}
+    with open(bin_path, "rb") as f:
+        num_pts = struct.unpack("<Q", f.read(8))[0]
+        for _ in range(num_pts):
+            pt_id = struct.unpack("<Q", f.read(8))[0]
+            xyz = struct.unpack("<3d", f.read(24))
+            f.read(3)   # rgb (3 bytes)
+            f.read(8)   # error (double)
+            track_len = struct.unpack("<Q", f.read(8))[0]
+            f.read(track_len * 8)  # track: image_id (int32) + point2D_idx (int32)
+            points3d[pt_id] = np.array(xyz)
     return points3d
 
 def read_colmap_images(sparse_dir):
     """Read images.bin using 3DGS's proven COLMAP reader."""
     import sys
-    # Use the 3DGS COLMAP reader which handles all format variants correctly
     gs_path = str(Path(__file__).parent.parent.parent / "gaussian-splatting")
     if gs_path not in sys.path:
         sys.path.insert(0, gs_path)
-    
     from scene.colmap_loader import read_extrinsics_binary
-    
-    bin_path = os.path.join(sparse_dir, "images.bin")
-    cam_extrinsics = read_extrinsics_binary(bin_path)
-    
+    cam_extrinsics = read_extrinsics_binary(
+        os.path.join(sparse_dir, "images.bin"))
     images = {}
     for img_id, extr in cam_extrinsics.items():
-        # extr has: id, qvec, tvec, camera_id, name, xys, point3D_ids
-        xys_combined = np.zeros((len(extr.xys), 3))
-        if len(extr.xys) > 0:
-            xys_combined[:, :2] = np.array(extr.xys)
-            xys_combined[:, 2] = np.array(extr.point3D_ids, dtype=float)
         images[img_id] = {
             "name": extr.name,
             "qvec": np.array(extr.qvec),
             "tvec": np.array(extr.tvec),
             "camera_id": extr.camera_id,
-            "xys": xys_combined
+            "xys": np.array(extr.xys),               # (N, 2)
+            "point3D_ids": np.array(extr.point3D_ids) # (N,)
         }
     return images
 
@@ -119,70 +103,47 @@ def qvec_to_rotmat(qvec):
 
 def align_scale_to_colmap(mono_depth, img_data, points3d, K, R, t):
     """
-    Align MiDaS relative depth to metric COLMAP scale using sparse 3D
-    points visible in this image as anchors.
-
-    Solves: mono_depth * scale + shift = colmap_metric_depth
-    via least squares over all visible COLMAP points.
-
-    Args:
-        mono_depth : (H, W) MiDaS depth map (relative, 0-1)
-        img_data   : dict with 'xys' array of shape (N, 3) — each row
-                     is (x_pixel, y_pixel, point3D_id)
-        points3d   : dict of point3D_id -> xyz (world coords)
-        K          : (3,3) camera intrinsics
-        R          : (3,3) rotation matrix (world-to-camera)
-        t          : (3,) translation vector (world-to-camera)
-
-    Returns:
-        scale, shift : floats for aligned_depth = mono * scale + shift
+    Align MiDaS relative depth to metric COLMAP scale using visible
+    3D points as anchors. Solves: mono * scale + shift = metric_depth
     """
     H, W = mono_depth.shape
-    xys = img_data["xys"]  # (N, 3): x, y, point3d_id
+    xys = img_data["xys"]            # (M, 2)
+    pt_ids = img_data["point3D_ids"] # (M,)
 
-    sfm_mono = []    # MiDaS depth at SfM point locations
-    sfm_metric = []  # COLMAP metric depth at same locations
+    sfm_mono = []
+    sfm_metric = []
 
-    for row in xys:
-        x2d, y2d, pt_id_f = row
-        if np.isnan(pt_id_f):
-            continue
-        pt_id = int(row[2])
+    for i in range(len(pt_ids)):
+        pt_id = int(pt_ids[i])
         if pt_id == -1 or pt_id not in points3d:
             continue
 
-        # Project 3D point into camera to get metric depth
-        pt_world = points3d[pt_id]
-        pt_cam = R @ pt_world + t
-        depth_metric = pt_cam[2]
-
-        if depth_metric < 0.1:
-            continue
-
-        # Sample MiDaS depth at this pixel
+        x2d, y2d = xys[i]
         px = int(np.clip(x2d, 0, W - 1))
         py = int(np.clip(y2d, 0, H - 1))
         mono_val = mono_depth[py, px]
-
         if mono_val < 0.01:
+            continue
+
+        # Project 3D point to get metric depth
+        pt_cam = R @ points3d[pt_id] + t
+        depth_metric = pt_cam[2]
+        if depth_metric < 0.1:
             continue
 
         sfm_mono.append(mono_val)
         sfm_metric.append(depth_metric)
 
-    n_anchors = len(sfm_mono)
-    if n_anchors < 3:
-        print(f"  Warning: only {n_anchors} anchor points — using scale=1")
+    n = len(sfm_mono)
+    if n < 3:
+        print(f"  Warning: only {n} anchor points — using scale=1")
         return 1.0, 0.0
 
-    # Least squares: [mono | 1] * [scale, shift]^T = metric_depth
-    A = np.stack([sfm_mono, np.ones(n_anchors)], axis=1)
-    b = np.array(sfm_metric)
-    result = np.linalg.lstsq(A, b, rcond=None)
+    A = np.stack([sfm_mono, np.ones(n)], axis=1)
+    result = np.linalg.lstsq(A, np.array(sfm_metric), rcond=None)
     scale, shift = result[0]
-
     print(f"  Scale alignment: scale={scale:.4f}, shift={shift:.4f} "
-          f"from {n_anchors} anchor points")
+          f"from {n} anchors")
     return float(scale), float(shift)
 
 
