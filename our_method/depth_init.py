@@ -194,11 +194,15 @@ def create_depth_init(sparse_data_dir, output_ply_path,
         points3d = read_colmap_points3d(str(orig_sparse))
         print(f"  {len(points3d)} 3D anchor points loaded")
         # Copy 2D track data into our subsampled images by matching name
+        name_to_orig = {od["name"]: od for od in images_with_tracks.values()}
         for img_id, img_data in images.items():
-            for orig_id, orig_data in images_with_tracks.items():
-                if orig_data["name"] == img_data["name"]:
-                    img_data["xys"] = orig_data["xys"]
-                    break
+            name = img_data["name"]
+            if name in name_to_orig:
+                orig = name_to_orig[name]
+                img_data["xys"] = orig["xys"]
+                img_data["point3D_ids"] = orig["point3D_ids"]  # ← this was missing
+                print(f"  Copied {np.sum(orig['point3D_ids'] != -1)} "
+                      f"tracks for {name}")
     else:
         print("Loading COLMAP 3D points for scale alignment...")
         points3d = read_colmap_points3d(str(sparse_dir))
